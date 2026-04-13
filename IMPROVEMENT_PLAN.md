@@ -440,6 +440,115 @@ with `pytest` and no hardware:
 
 ---
 
+## Phase 8 — SendSpin Integration
+
+[SendSpin](https://www.sendspin-audio.com/) is the open multi-room audio
+standard from the Open Home Foundation. It is the native protocol used by
+Music Assistant and Home Assistant Voice Preview Edition for audio
+distribution. Making the radio a SendSpin source gives it first-class presence
+in both ecosystems without any custom MQTT wiring or template sensors.
+
+**Prerequisite: Phase 6 (GStreamer pipeline).** The GStreamer `tee` element
+introduced in Phase 6 is the natural insertion point: one branch feeds the
+local audio output, the second branch feeds the SendSpin sender.
+
+### 8.1 Protocol overview
+
+| Layer | Detail |
+|---|---|
+| Transport | WebSocket (JSON control frames, binary audio/artwork frames) |
+| Discovery | mDNS — clients advertise `_sendspin._tcp.local`; server discovers and connects |
+| Synchronisation | Kalman-filter clock alignment; audio chunks carry server-clock timestamps |
+| Client roles | `player` (audio), `controller` (play/pause/volume), `metadata`, `artwork`, `visualizer` |
+
+### 8.2 Python library
+
+The official Python SDK is **`aiosendspin`** (asyncio), used by Music
+Assistant itself. Because the existing backend is threaded, `aiosendspin` runs
+in its own asyncio event loop on a dedicated daemon thread. The bridge is a
+thread-safe queue: the GStreamer appsink callback enqueues PCM chunks; the
+asyncio loop dequeues and forwards them as timestamped binary WebSocket frames.
+
+### 8.3 Audio path
+
+The Phase 6 GStreamer pipeline gains a second sink branch:
+
+```
+pipewiresrc
+    │
+    ▼
+audio/x-raw, format=S16LE, rate=48000, channels=2
+    │
+    ▼
+  tee
+  ├──► autoaudiosink / pulsesink   (local output — existing)
+  └──► appsink name=sendspin_sink  (new — feeds aiosendspin)
+```
+
+The `appsink` emits `new-sample` signals; a callback running on the GStreamer
+bus thread enqueues raw PCM buffers into a `queue.SimpleQueue`. The asyncio
+sender loop reads from that queue and forwards chunks to all connected
+SendSpin player clients.
+
+### 8.4 Metadata push
+
+`RadioBackend` already exposes station name, RDS RadioText (FM), and DLS text
+(DAB) via `get_status()`. The SendSpin sender thread compares the current
+metadata snapshot on each status tick (already fired every ~350 ms by the OLED
+loop). When any field changes, it calls `aiosendspin`'s metadata update method,
+which pushes a JSON frame to all connected `metadata` role clients.
+
+Fields mapped to SendSpin metadata:
+
+| SendSpin field | Source |
+|---|---|
+| `title` | RDS RadioText / DAB DLS text |
+| `artist` | Parsed from DLS "Artist - Title" if separator present |
+| `station` | Station label from station list |
+| `image_url` | Served via existing `/api/dab/artwork` endpoint |
+
+### 8.5 Artwork push
+
+`get_dab_artwork()` already fetches the MOT slideshow image from the chip.
+When the image hash changes (checked on the same 350 ms tick), the new JPEG
+or PNG bytes are pushed as a binary WebSocket frame to connected `artwork`
+role clients. FM stations without MOT can fall back to a static station logo
+if one is bundled in `static/`.
+
+### 8.6 `RadioConfig` additions
+
+```python
+sendspin_enabled: bool = False
+sendspin_port: int = 7864        # SendSpin default port
+sendspin_name: str = "Pi Radio"  # advertised mDNS service name
+```
+
+### 8.7 API additions
+
+| Endpoint | Method | Body | Effect |
+|---|---|---|---|
+| `/api/sendspin` | POST | `{"enabled": true/false}` | Start or stop the SendSpin server at runtime |
+| `/api/status` | GET | — | Add `sendspin_active` and `sendspin_clients` count to existing response |
+
+### 8.8 Dependency additions
+
+| Package | Reason |
+|---|---|
+| `aiosendspin` (PyPI) | SendSpin asyncio SDK |
+| `python3-zeroconf` | mDNS advertisement (may be bundled with `aiosendspin`) |
+
+### 8.9 Home Assistant and Music Assistant
+
+Once the Pi advertises `_sendspin._tcp.local`, Music Assistant discovers it
+automatically as an audio output. No configuration is needed on the MA side.
+In Home Assistant, the SendSpin integration exposes each connected client group
+as a `media_player` entity. The radio tuner control (station selection, mode
+switching, volume) continues to use the MQTT `media_player` entity described
+in the HA integration notes; SendSpin handles only the audio distribution and
+now-playing metadata.
+
+---
+
 ## Dependency Changes (Pi OS Trixie)
 
 | Action | Package | Reason |
@@ -448,6 +557,8 @@ with `pytest` and no hardware:
 | Add    | `python3-gst-1.0` | GStreamer Python bindings (requires Python 3.12) |
 | Add    | `gstreamer1.0-pipewire` | Native PipeWire GStreamer element |
 | Add    | `gir1.2-wp-0.4` | WirePlumber GI bindings for device discovery |
+| Add    | `aiosendspin` (PyPI) | SendSpin asyncio SDK (Phase 8) |
+| Add    | `python3-zeroconf` | mDNS advertisement for SendSpin (Phase 8) |
 
 Existing dependencies (`python3-spidev`, `python3-rpi.gpio`, `python3-smbus2`,
 `python3-pillow`) are unchanged.
@@ -474,7 +585,10 @@ Phase 4 (concurrency)   Phase 5 (recording pipeline)
     │                      │
     └──────────┬───────────┘
                ▼
-          Phase 6 (chip features)
+          Phase 6 (chip features + GStreamer pipeline)
+               │
+               ▼
+          Phase 8 (SendSpin integration)
 ```
 
 Phases 1–3 are prerequisite to everything else: bugs fixed, code modernised,
@@ -483,4 +597,6 @@ immediately after Phase 3 because testing a 2,500-line monolith is much
 harder than testing extracted modules. Phases 4 and 5 are independent of each
 other and can proceed in parallel. Phase 6 chip features build on the
 concurrency fixes in Phase 4 (RDS polling and hardware seek both require the
-lock to be releasable during waits).
+lock to be releasable during waits). Phase 8 (SendSpin) depends on the
+GStreamer pipeline from Phase 6, which provides the `appsink` branch that
+feeds the SendSpin audio sender.
